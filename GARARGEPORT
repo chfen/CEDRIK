@@ -1,0 +1,284 @@
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+
+const char *ssid = "a";
+const char *password = "";
+AsyncWebServer server(80); 
+const int R1 = 19; // Relay 1 (Open)
+const int R2 = 17; // Relay 2 (Close)
+const int D1 = 27; // Digital Input (Door Open)
+const int D2 = 26; // Digital Input (Door Closed)
+const int D3 = 18; // Digital Input (Button)
+
+// Timing Variables
+unsigned long debounceTime = 0;
+const unsigned long debounceDelay = 400; // 1 second debounce delay
+bool relayActive = false;
+bool lastButtonState = LOW; // Track previous button state
+bool toggleDirection = true; // Toggle between R1 and R2
+unsigned long lastRelaySwitchTime = 0;
+const unsigned long relaySwitchDelay = 400; // 1 second delay between switching
+unsigned long lastToggleTime = 0;
+const unsigned long debounceDelayhttp = 1000;  // Delay in milliseconds, e.g., 3000ms = 3 seconds
+unsigned long lastToggleTimehttp = 0;
+
+void stopAllRelays() {
+    digitalWrite(R1, LOW);
+    digitalWrite(R2, LOW);
+}
+
+enum ButtonState { OPEN, STOP, CLOSE, STOP1};
+ButtonState buttonState = STOP; 
+
+
+void keepWiFiAlive(void * parameter){
+    while(1) {
+        if(WiFi.status() != WL_CONNECTED) {
+            Serial.println("Connecting to WiFi...");
+            WiFi.begin(ssid, password);
+
+            int retryCount = 0;
+            while (WiFi.status() != WL_CONNECTED && retryCount < 10) {
+                delay(3000);
+                Serial.print(".");
+                retryCount++;
+            }
+
+            if (WiFi.status() == WL_CONNECTED) {
+                Serial.println("Connected to WiFi");
+                Serial.println("IP address: " + WiFi.localIP().toString());
+            } else {
+                Serial.println("Failed to connect to WiFi. Try again...");
+            }
+        }
+        // Check the connection status every 30 seconds
+        delay(30000);
+    }
+}
+
+void alternateState() {
+    switch (buttonState) {
+        case OPEN:
+            stopAllRelays();
+            buttonState = STOP;
+            break;
+        case STOP:
+            stopAllRelays();
+            buttonState = CLOSE;
+            break;
+        case CLOSE:
+            stopAllRelays();
+            buttonState = STOP1;
+            break;
+        case STOP1:
+            stopAllRelays();
+            buttonState = OPEN;
+            break;
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    pinMode(R1, OUTPUT);
+    pinMode(R2, OUTPUT);
+    pinMode(D1, INPUT_PULLUP);
+    pinMode(D2, INPUT_PULLUP);
+    pinMode(D3, INPUT_PULLUP);
+    stopAllRelays();
+
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+
+    // Create a task that will execute the 'keepWiFiAlive' function
+    xTaskCreatePinnedToCore(
+        keepWiFiAlive,   /* Task function. */
+        "WiFiManagerTask",  /* Name of the task. */
+        4096,            /* Stack size of the task */
+        NULL,             /* Parameter of the task */
+        1,                /* Priority of the task */
+        NULL,             /* Task handle to keep track of created task */
+        0);               /* Pin task to core 0 */
+
+    // Web server endpoints
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+        request->send(200, "text/html", index_html());  // Send HTML content
+    });
+
+    server.on("/toggle", HTTP_GET, [](AsyncWebServerRequest *request){
+        unsigned long currentTime = millis();
+        if (currentTime - lastToggleTimehttp > debounceDelayhttp) {  // Use the correct variable
+            lastToggleTimehttp = currentTime;  // Correct variable updated
+            alternateState();
+            request->send(200, "text/plain", "Toggled Successfully");
+        } else {
+            request->send(429, "text/plain", "Toggle too fast. Please wait.");
+        }
+    });
+
+    server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+        String status = getStatus();
+        request->send(200, "application/json", status);
+    });
+
+    server.begin();
+    Serial.println("Web server started");
+}
+
+String index_html() {
+    return R"rawliteral(
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <style>
+          body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            background-color: #f4f4f9;
+            margin: 0;
+            padding: 20px;
+          }
+          h2 {
+            color: #333;
+          }
+          button {
+            font-size: 24px;
+            padding: 20px;
+            width: 200px;
+            height: 100px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+          }
+          button:hover {
+            background-color: #45a049;
+          }
+          #status {
+            margin-top: 20px;
+            padding: 10px;
+            width: 300px;
+            border: 1px solid #ddd;
+            border-radius: 10px;
+            background-color: #fff;
+          }
+          .status-item {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 5px;
+            padding: 5px 0;
+          }
+          .status-label {
+            font-weight: bold;
+          }
+          .status-value {
+            padding: 5px;
+            border-radius: 5px;
+          }
+          .low {
+            background-color: red;
+            color: white;
+          }
+          .high {
+            background-color: green;
+            color: white;
+          }
+        </style>
+      </head>
+      <body>
+        <h2>Control Panel</h2>
+        <button onclick="toggleRelay()">Toggle</button>
+        <div id="status"></div>
+        <script>
+          function toggleRelay() {
+            fetch('/toggle')
+              .then(response => response.text())
+              .then(data => {
+                console.log(data);
+                updateStatus();
+              });
+          }
+
+          function updateStatus() {
+            fetch('/status')
+              .then(response => response.json())
+              .then(data => {
+                const statusDiv = document.getElementById('status');
+                statusDiv.innerHTML = `
+                  <div class="status-item">
+                    <span class="status-label">Door Opened:</span>
+                    <span class="status-value ${data.DoorOpen ? 'high' : 'low'}">${data.DoorOpen}</span>
+                  </div>
+                  <div class="status-item">
+                    <span class="status-label">Door Closed:</span>
+                    <span class="status-value ${data.DoorClose ? 'high' : 'low'}">${data.DoorClose}</span>
+                  </div>
+                  <div class="status-item">
+                    <span class="status-label">Button Pressed:</span>
+                    <span class="status-value ${data.ButtonPress ? 'high' : 'low'}">${data.ButtonPress}</span>
+                  </div>
+                  <div class="status-item">
+                    <span class="status-label">R1 Opening:</span>
+                    <span class="status-value ${data.R1Open ? 'high' : 'low'}">${data.R1Open}</span>
+                  </div>
+                  <div class="status-item">
+                    <span class="status-label">R2 Closing:</span>
+                    <span class="status-value ${data.R2Close ? 'high' : 'low'}">${data.R2Close}</span>
+                  </div>
+                `;
+              });
+          }
+
+          document.addEventListener('DOMContentLoaded', () => {
+            updateStatus();
+            setInterval(updateStatus, 2000); // Update every 2 seconds
+          });
+        </script>
+      </body>
+    </html>
+    )rawliteral";
+}
+
+String getStatus() {
+    String message = "{";
+    message += "\"DoorOpen\":" + String(digitalRead(D1)) + ",";
+    message += "\"DoorClose\":" + String(digitalRead(D2)) + ",";
+    message += "\"ButtonPress\":" + String(digitalRead(D3)) + ",";
+    message += "\"R1Open\":" + String(digitalRead(R1)) + ",";
+    message += "\"R2Close\":" + String(digitalRead(R2));
+    message += "}";
+    return message;
+}
+
+void loop() {
+    int dooropen = digitalRead(D1);
+    int doorclose = digitalRead(D2);
+    int buttonpress = digitalRead(D3);
+    int R1open = digitalRead(R1);
+    int R2close = digitalRead(R2);
+
+    bool currentButtonState = buttonpress;
+    bool buttonStateChanged = (currentButtonState != lastButtonState);
+
+    if (buttonStateChanged && currentButtonState == HIGH && (millis() - debounceTime > debounceDelay)) {
+        delay(relaySwitchDelay);
+        alternateState();
+        debounceTime = millis(); // Update debounce time
+    }
+
+    lastButtonState = currentButtonState; // Update last button state
+    //Kör inte samtidigt
+    if (digitalRead(R1) == HIGH && digitalRead(R2) == HIGH) {stopAllRelays();}
+    if (buttonState == OPEN ) {digitalWrite(R1, HIGH);} 
+    if (buttonState == CLOSE ) {digitalWrite(R2, HIGH);} 
+    if (dooropen == LOW && buttonState == OPEN ) {buttonState = STOP;}
+    if (doorclose == LOW && buttonState == CLOSE ) {buttonState = STOP1;}    
+    if (buttonState == STOP) {stopAllRelays(); digitalWrite(R2, LOW); digitalWrite(R1, LOW);}
+    if (buttonState == STOP1) {stopAllRelays(); digitalWrite(R2, LOW); digitalWrite(R1, LOW);}
+
+
+}
